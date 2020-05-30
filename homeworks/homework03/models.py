@@ -6,13 +6,15 @@ import random
 
 
 class GruEncoder(nn.Module):
-    def __init__(self, input_dim, emb_dim, hid_dim, n_layers, dropout):
+    def __init__(self, input_dim, emb_dim, hid_dim, n_layers, bidirectional, dropout):
         super().__init__()
         
         self.input_dim = input_dim
         self.emb_dim = emb_dim
         self.hid_dim = hid_dim
         self.n_layers = n_layers
+        self.bidirectional = bidirectional
+        self.n_directions = 2 if bidirectional else 1
         
         self.embedding = nn.Embedding(
             num_embeddings=input_dim,
@@ -23,25 +25,23 @@ class GruEncoder(nn.Module):
             input_size=emb_dim,
             hidden_size=hid_dim,
             num_layers=n_layers,
-            dropout=dropout
+            dropout=dropout,
+            bidirectional=bidirectional
         )
         
         self.dropout = nn.Dropout(p=dropout)
         
-    def forward(self, src, hidden=None):        
+    def forward(self, src):        
         # src = [src sent len, batch size]        
         embedded = self.embedding(src) # [src sent len, batch size, emb dim]
         embedded = self.dropout(embedded)
         
-        if hidden is None:
-            output, hidden = self.rnn(embedded)
-        else:
-            output, hidden = self.rnn(embedded, hidden)
+        output, hidden = self.rnn(embedded)
         
         # output = [src sent len, batch size, hid dim * n directions]
         # hidden = [n layers * n directions, batch size, hid dim]
         
-        return hidden
+        return output, hidden
 
 
 class AttentionGruDecoder(nn.Module):
@@ -74,10 +74,10 @@ class AttentionGruDecoder(nn.Module):
         
         self.dropout = nn.Dropout(p=dropout)
         
-    def forward(self, input, hidden, encoder_outputs):        
+    def forward(self, input, hidden, context):        
         # input = [batch size]
-        # hidden = [n layers * n directions, batch size, hid dim]
-        # encoder_outputs = [batch size, src sent len, dimensions = n layers * hid dim]
+        # hidden = [n layers, batch size, hid dim]
+        # context = [batch size, src sent len, n layers * hid dim]
         
         batch_size = input.shape[0]        
         input = input.unsqueeze(0) # [1, batch size]
@@ -85,14 +85,14 @@ class AttentionGruDecoder(nn.Module):
         embedded = self.dropout(self.embedding(input)) # [1, batch size, emb dim]
         
         output, hidden = self.rnn(embedded, hidden)
-        # output = [sent len, batch size, hid dim * n directions]
-        # hidden = [n layers * n directions, batch size, hid dim]
+        # output = [sent len, batch size, hid dim]
+        # hidden = [n layers, batch size, hid dim]
         
-        # [batch size, output length = 1, dimensions = n layers * n directions * hid dim]
+        # [batch size, output length = 1, dimensions = n layers * hid dim]
         query = hidden.permute(1, 0, 2).reshape(batch_size, 1, self.n_layers * self.hid_dim)
         
         # [batch size, output length = 1, dimensions = n layers * hid dim]
-        attention_output, _ = self.attention(query, encoder_outputs)
+        attention_output, _ = self.attention(query, context)
         
         # [batch size, dimensions = n layers * hid dim]
         attention_output = attention_output.squeeze(1)
@@ -111,32 +111,43 @@ class AttentionGruSeq2Seq(nn.Module):
         self.decoder = decoder
         self.device = device
         
-        assert encoder.hid_dim == decoder.hid_dim, \
-            "Hidden dimensions of encoder and decoder must be equal!"
-        assert encoder.n_layers == decoder.n_layers, \
-            "Encoder and decoder must have equal number of layers!"
+        self.state_mapper = nn.Linear(
+            in_features=encoder.n_layers * encoder.n_directions * encoder.hid_dim,
+            out_features=decoder.n_layers * decoder.hid_dim
+        )
+        
+        self.context_mapper = nn.Linear(
+            in_features=encoder.n_directions * encoder.hid_dim,
+            out_features=decoder.n_layers * decoder.hid_dim
+        )
     
     def apply_encoder(self, src):
         # src = [src sent len, batch size]
         
-        batch_size = src.shape[1]
-        encoder_state_size = self.encoder.n_layers * self.encoder.hid_dim
+        src_len, batch_size = src.shape
         
-        # [src sent len, batch size, dimensions = n layers * hid dim]
-        encoder_states = torch.zeros(src.shape[0], batch_size, encoder_state_size).to(self.device)
+        # output = [src sent len, batch size, hid dim * n directions]
+        # hidden = [n layers * n directions, batch size, hid dim]
+        output, hidden = self.encoder(src)
         
-        first_encoder_input = src[0].unsqueeze(0) # [1, batch size]
-        hidden = self.encoder(first_encoder_input) # [n layers * n directions, batch size, hid dim]
+        context = output.view(src_len * batch_size, self.encoder.hid_dim * self.encoder.n_directions)
+        context = self.context_mapper(context) # [src sent len * batch size, dec n layers * dec hid dim]
+        context = (context
+                   .reshape(src_len, batch_size, self.decoder.n_layers * self.decoder.hid_dim)
+                   .permute(1 ,0, 2)
+                   .contiguous()) # [batch size, src sent len, dec n layers * dec hid dim]
+        
         # [batch size, n layers * n directions * hid dim]
-        encoder_states[0] = hidden.permute(1,0,2).reshape(batch_size, encoder_state_size)
+        hidden = hidden.permute(1, 0, 2).reshape(batch_size,
+                                                 self.encoder.n_layers * self.encoder.n_directions * self.encoder.hid_dim)
+        hidden = self.state_mapper(hidden) # [batch size, dec n layers * dec hid dim]
         
-        for t in range(1, src.shape[0]):
-            hidden = self.encoder(src[t].unsqueeze(0), hidden)
-            encoder_states[t] = hidden.permute(1,0,2).reshape(batch_size, encoder_state_size)
+        # [dec n layers, batch size, dec hid dim]
+        hidden = hidden.reshape(batch_size, self.decoder.n_layers, self.decoder.hid_dim).permute(1, 0, 2).contiguous()
         
-        # [batch size, src sent len, dimensions = n layers * hid dim]
-        encoder_states = encoder_states.permute(1, 0, 2)
-        return encoder_states, hidden
+        # context = [batch size, src sent len, dec n layers * dec hid dim]
+        # hidden = [dec n layers, batch size, dec hid dim]
+        return context, hidden
     
     def forward(self, src, trg, teacher_forcing_ratio=0.5):        
         # src = [src sent len, batch size]
@@ -148,9 +159,9 @@ class AttentionGruSeq2Seq(nn.Module):
         max_len = trg.shape[0]
         trg_vocab_size = self.decoder.output_dim
         
-        # encoder_states = [batch size, src sent len, dimensions = n layers * hid dim]
-        # hidden = [n layers * n directions, batch size, hid dim]
-        encoder_states, hidden = self.apply_encoder(src)
+        # context = [batch size, src sent len, dec n layers * dec hid dim]
+        # hidden = [dec n layers, batch size, dec hid dim]
+        context, hidden = self.apply_encoder(src)
         decoder_outputs = torch.zeros(max_len, batch_size, trg_vocab_size).to(self.device)
         
         # first input to the decoder is the <sos> tokens
@@ -158,8 +169,8 @@ class AttentionGruSeq2Seq(nn.Module):
         
         for t in range(1, max_len):
             # output = [batch size, output dim]
-            # hidden = [n layers * n directions, batch size, hid dim]
-            output, hidden = self.decoder(input, hidden, encoder_states)
+            # hidden = [n layers, batch size, hid dim]
+            output, hidden = self.decoder(input, hidden, context)
             decoder_outputs[t] = output
             teacher_force = random.random() < teacher_forcing_ratio
             top1 = output.max(1)[1]
