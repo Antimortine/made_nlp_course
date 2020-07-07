@@ -104,3 +104,11 @@ venv.bak/
 .mypy_cache/
 
 .DS_Store
+
+homeworks/homework05/solution/data
+homeworks/homework05/solution/annotations
+homeworks/homework05/solution/train2017
+homeworks/homework05/solution/val2017
+homeworks/homework05/solution/annotations_trainval2017.zip
+homeworks/homework05/solution/train2017.zip
+homeworks/homework05/solution/val2017.zip
